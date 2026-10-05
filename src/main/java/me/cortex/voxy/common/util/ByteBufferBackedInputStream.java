@@ -20,6 +20,8 @@ public class ByteBufferBackedInputStream extends InputStream {
     }
 
     public int read(byte[] bytes, int off, int len) throws IOException {
+        java.util.Objects.checkFromIndexSize(off, len, bytes.length);
+        if (len == 0) return 0;
         if (!this.buf.hasRemaining()) {
             return -1;
         }

@@ -3,31 +3,17 @@ package me.cortex.voxy.client.core;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.gl.GlTexture;
-import me.cortex.voxy.client.core.gl.shader.Shader;
-import me.cortex.voxy.client.core.gl.shader.ShaderType;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.hierachical.HierarchicalOcclusionTraverser;
 import me.cortex.voxy.client.core.rendering.hierachical.NodeCleaner;
 import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
-import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
-import net.minecraft.client.Minecraft;
+import me.cortex.voxy.client.core.util.GPUTiming;
 import org.joml.Matrix4f;
-import org.lwjgl.system.MemoryStack;
 
+import java.util.List;
 import java.util.function.BooleanSupplier;
 
-import static org.lwjgl.opengl.ARBComputeShader.glDispatchCompute;
-import static org.lwjgl.opengl.ARBShaderImageLoadStore.glBindImageTexture;
-import static org.lwjgl.opengl.GL11.GL_BLEND;
-import static org.lwjgl.opengl.GL11.GL_ONE;
-import static org.lwjgl.opengl.GL11.GL_ONE_MINUS_SRC_ALPHA;
-import static org.lwjgl.opengl.GL11.GL_SRC_ALPHA;
-import static org.lwjgl.opengl.GL11.glEnable;
-import static org.lwjgl.opengl.GL11C.GL_NEAREST;
-import static org.lwjgl.opengl.GL11C.GL_RGBA8;
-import static org.lwjgl.opengl.GL14.glBlendFuncSeparate;
-import static org.lwjgl.opengl.GL15.GL_READ_WRITE;
 import static org.lwjgl.opengl.GL30C.*;
 import static org.lwjgl.opengl.GL43.GL_DEPTH_STENCIL_TEXTURE_MODE;
 import static org.lwjgl.opengl.GL45C.glBindTextureUnit;
@@ -38,22 +24,40 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     private GlTexture colourSSAOTex;
     private final GlFramebuffer fbSSAO = new GlFramebuffer();
 
-    private final boolean useEnvFog;
+    private final FogMode fogMode;
     private final FullscreenBlit finalBlit;
 
-    private final Shader ssaoCompute = Shader.make()
-            .add(ShaderType.COMPUTE, "voxy:post/ssao.comp")
-            .compile();
+    private final SSAO ssao;
 
-    protected NormalRenderPipeline(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier) {
-        super(nodeManager, nodeCleaner, traversal, frexSupplier, false);
-        this.useEnvFog = VoxyConfig.CONFIG.useEnvironmentalFog;
-        this.finalBlit = new FullscreenBlit("voxy:post/blit_texture_depth_cutout.frag",
-                a->a.defineIf("USE_ENV_FOG", this.useEnvFog).define("EMIT_COLOUR"));
+    public enum FogMode {
+        FOG_AND_FADE(false, true, true),
+        FOG(false, true, false),
+        FADE(true, false, true),
+        OFF(true, false, false);
+        public final boolean removesVanillaEnvFog;
+        public final boolean hasFog;
+        public final boolean hasFade;
+
+        FogMode(boolean removesVanillaEnvFog, boolean hasFog, boolean hasFade) {
+            this.removesVanillaEnvFog = removesVanillaEnvFog;
+            this.hasFog = hasFog;
+            this.hasFade = hasFade;
+        }
+    }
+
+    protected NormalRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier) {
+        super(properties, nodeManager, nodeCleaner, traversal, frexSupplier, false);
+        this.fogMode = VoxyConfig.CONFIG.getFogMode();
+        this.finalBlit = new FullscreenBlit(properties, "voxy:post/blit_texture_depth_cutout.frag",
+                a->a.defineIf("HAS_FOG", this.fogMode.hasFog)
+                        .defineIf("HAS_FADE", this.fogMode.hasFade).define("EMIT_COLOUR"));
+
+
+        this.ssao = SSAO.createSSAO(properties, VoxyConfig.CONFIG.getSSAOMode());
     }
 
     @Override
-    protected int setup(Viewport<?> viewport, int sourceFB, int srcWidth, int srcHeight) {
+    protected int setup(Viewport<?> viewport, int sourceDepthTex, int srcWidth, int srcHeight) {
         if (this.colourTex == null || this.colourTex.getHeight() != viewport.height || this.colourTex.getWidth() != viewport.width) {
             if (this.colourTex != null) {
                 this.colourTex.free();
@@ -75,53 +79,62 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
             glTextureParameterf(this.fb.getDepthTex().id, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_DEPTH_COMPONENT);
         }
 
-        this.initDepthStencil(sourceFB, this.fb.framebuffer.id, viewport.width, viewport.height, viewport.width, viewport.height);
-
+        this.initDepthStencil(viewport, sourceDepthTex, this.fb.framebuffer.id, srcWidth, srcHeight, viewport.width, viewport.height);
         return this.fb.getDepthTex().id;
     }
 
     @Override
-    protected void postOpaquePreTranslucent(Viewport<?> viewport) {
-        this.ssaoCompute.bind();
-        try (var stack = MemoryStack.stackPush()) {
-            long ptr = stack.nmalloc(4*4*4);
-            viewport.MVP.getToAddress(ptr);
-            nglUniformMatrix4fv(3, 1, false, ptr);//MVP
-            viewport.MVP.invert(new Matrix4f()).getToAddress(ptr);
-            nglUniformMatrix4fv(4, 1, false, ptr);//invMVP
-        }
-
-
-        glBindImageTexture(0, this.colourSSAOTex.id, 0, false,0, GL_READ_WRITE, GL_RGBA8);
-        glBindTextureUnit(1, this.fb.getDepthTex().id);
-        glBindTextureUnit(2, this.colourTex.id);
-
-        glDispatchCompute((viewport.width+31)/32, (viewport.height+31)/32, 1);
-
+    protected void postOpaquePreTranslucent(Viewport<?> viewport, int sourceDepthTexture) {
+        GPUTiming.INSTANCE.marker("ao");
+        this.ssao.computeSSAO(viewport, this.colourSSAOTex, this.colourTex, this.fb.getDepthTex(), sourceDepthTexture);
         glBindFramebuffer(GL_FRAMEBUFFER, this.fbSSAO.id);
     }
 
     @Override
-    protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
+    protected void finish(Viewport<?> viewport, int sourceDepthTexture, int outputFramebuffer, int srcWidth, int srcHeight) {
         this.finalBlit.bind();
-        // MC 1.21.1 / Sodium 0.6.x: Environmental fog disabled
-        // FogParameters.environmental*() methods don't exist in Sodium 0.6.x
-        // RenderSystem.getShaderFog*() returns standard fog (underwater/lava) not environmental fog
-        // TODO: Research Sodium 0.6.x environmental fog API or implement custom distance-based fog
-        if (this.useEnvFog) {
-            // Disable fog uniforms - set to zero (no fog effect)
-            glUniform4f(4, 0, 0, 0, 0);
-            glUniform4f(5, 0, 0, 0, 0);
+        boolean fogCoversAllRendering = viewport.fogParameters.environmentalEnd()<VoxyRenderSystem.getVanillaRenderDistance();
+
+        if (this.fogMode.hasFog) {
+            float start = viewport.fogParameters.environmentalStart();
+            float end = viewport.fogParameters.environmentalEnd();
+            if (Math.abs(end-start)>1) {
+                float invEndFogDelta = 1f / (end - start);
+                float endDistance = Math.max(VoxyRenderSystem.getVanillaRenderDistance(), 20*16);//TODO: make this constant a config option
+                endDistance *= (float)Math.sqrt(3);
+                float startDelta = -start * invEndFogDelta;
+                glUniform4f(4, invEndFogDelta, startDelta, Math.clamp(endDistance*invEndFogDelta+startDelta, 0, 1),0);//
+                glUniform4f(5, viewport.fogParameters.red(), viewport.fogParameters.green(), viewport.fogParameters.blue(), viewport.fogParameters.alpha());
+            } else {
+                glUniform4f(4, 0, 0, 0, 0);
+                glUniform4f(5, 0, 0, 0, 0);
+            }
+        }
+        if (this.fogMode.hasFade) {
+            //TODO: this should be a compile time define
+            int MODE = 1;//0:off, 1:xz, 2:xyz
+            float rd = VoxyConfig.CONFIG.sectionRenderDistance*16*32 - (float)Math.sqrt(MODE>1?32*32*32:32*32);
+            float vanillaRd = VoxyRenderSystem.getVanillaRenderDistance();
+            float start = Math.max(vanillaRd, rd*0.9f);//start at 90% of the render distance (10% fade distance)
+            float end = Math.max(vanillaRd, rd);
+
+            float scale = 1.0f/(end-start);
+            glUniform4f(6, MODE, (-start)*scale, scale, 0);
         }
 
         glBindTextureUnit(3, this.colourSSAOTex.id);
 
         //Do alpha blending
-
-        glEnable(GL_BLEND);
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        AbstractRenderPipeline.transformBlitDepth(this.finalBlit, this.fb.getDepthTex().id, sourceFrameBuffer, viewport, new Matrix4f(viewport.vanillaProjection).mul(viewport.modelView));
-        glDisable(GL_BLEND);
+        //Unbelievably jank hack, only blit out to the framebuffer if we are rendering fog
+        if (!fogCoversAllRendering) {
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            AbstractRenderPipeline.transformBlitDepth(this.finalBlit, this.fb.getDepthTex().id, outputFramebuffer, viewport, new Matrix4f(viewport.vanillaProjection).mul(viewport.modelView));
+            glDisable(GL_BLEND);
+        } else {
+            glDisable(GL_STENCIL_TEST);
+            glDisable(GL_DEPTH_TEST);
+        }
         //glBlitNamedFramebuffer(this.fbSSAO.id, sourceFrameBuffer, 0,0, viewport.width, viewport.height, 0,0, viewport.width, viewport.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
 
@@ -138,12 +151,18 @@ public class NormalRenderPipeline extends AbstractRenderPipeline {
     @Override
     public void free() {
         this.finalBlit.delete();
-        this.ssaoCompute.free();
+        this.ssao.free();
         this.fbSSAO.free();
         if (this.colourTex != null) {
             this.colourTex.free();
             this.colourSSAOTex.free();
         }
         super.free0();
+    }
+
+    @Override
+    public void addDebug(List<String> debug) {
+        super.addDebug(debug);
+        this.ssao.addDebugInfo(debug);
     }
 }

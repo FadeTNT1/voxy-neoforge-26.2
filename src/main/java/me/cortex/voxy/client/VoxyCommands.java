@@ -1,26 +1,24 @@
 package me.cortex.voxy.client;
 
+import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
-import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
-import me.cortex.voxy.common.Logger;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import me.cortex.voxy.common.DebugUtils;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import me.cortex.voxy.commonImpl.importers.DHImporter;
 import me.cortex.voxy.commonImpl.importers.WorldImporter;
-import net.minecraft.client.Minecraft;
-import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.client.Minecraft;
 import net.minecraft.commands.SharedSuggestionProvider;
-import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.dimension.DimensionType;
+import net.minecraft.world.level.storage.LevelResource;
 
 import java.io.File;
 import java.io.IOException;
@@ -50,6 +48,8 @@ public class VoxyCommands {
                                 .executes(VoxyCommands::importZip)
                                 .then(Commands.argument("innerPath", StringArgumentType.string())
                                         .executes(VoxyCommands::importZip))))
+                .then(Commands.literal("current")
+                        .executes(VoxyCommands::importCurrentWorldIn))
                 .then(Commands.literal("cancel")
                         .executes(VoxyCommands::cancelImport));
 
@@ -60,10 +60,18 @@ public class VoxyCommands {
                             .executes(VoxyCommands::importDistantHorizons)));
         }
 
+        var debug = Commands.literal("debug")
+                .then(Commands.literal("verifyTLNChildMask")
+                        .executes(ctx->verifyTLNs(ctx, false))
+                        .then(Commands.argument("attemptRepair", BoolArgumentType.bool())
+                                .executes(ctx->verifyTLNs(ctx, BoolArgumentType.getBool(ctx, "attemptRepair"))))
+                );
+
         return Commands.literal("voxy")//.requires((ctx)-> VoxyCommon.getInstance() != null)
                 .then(Commands.literal("reload")
                         .executes(VoxyCommands::reloadInstance))
-                .then(imports);
+                .then(imports)
+                .then(debug);
     }
 
     private static int reloadInstance(CommandContext<CommandSourceStack> ctx) {
@@ -72,21 +80,37 @@ public class VoxyCommands {
             ctx.getSource().sendFailure(Component.translatable("Voxy must be enabled in settings to use this"));
             return 1;
         }
-        var wr = Minecraft.getInstance().levelRenderer;
-        if (wr!=null) {
-            ((IGetVoxyRenderSystem)wr).shutdownRenderer();
+
+        var vrsh = IVoxyRenderSystemHolder.getNullableHolder();
+        if (vrsh!=null) {
+            vrsh.voxy$shutdownRenderer();
         }
 
         VoxyCommon.shutdownInstance();
         System.gc();
         VoxyCommon.createInstance();
 
-        var r = Minecraft.getInstance().levelRenderer;
+        var r = Minecraft.getInstance().levelExtractor;
         if (r != null) r.allChanged();
         return 0;
     }
 
-
+    private static int verifyTLNs(CommandContext<CommandSourceStack> ctx, boolean attemptRepair) {
+        var instance = VoxyCommon.getInstance();
+        if (instance == null) {
+            ctx.getSource().sendFailure(Component.translatable("Voxy must be enabled in settings to use this"));
+            return 1;
+        }
+        if (Minecraft.getInstance().level == null) {
+            throw new IllegalStateException("How you even do this");
+        }
+        var engine = WorldIdentifier.ofEngine(Minecraft.getInstance().level);
+        if (engine!=null) {
+            DebugUtils.verifyAllTopLevelNodes(engine, attemptRepair);
+            return 0;
+        }
+        return 1;
+    }
 
 
     private static int importDistantHorizons(CommandContext<CommandSourceStack> ctx) {
@@ -196,6 +220,26 @@ public class VoxyCommands {
         return sb.buildFuture();
     }
 
+
+    private static int importCurrentWorldIn(CommandContext<CommandSourceStack> ctx) {
+        if (VoxyCommon.getInstance() == null) {
+            ctx.getSource().sendFailure(Component.translatable("Voxy must be enabled in settings to use this"));
+            return 1;
+        }
+
+        var localServer = Minecraft.getInstance().getSingleplayerServer();
+        if (localServer == null) {
+            ctx.getSource().sendFailure(Component.translatable("You must be in single player to use this command"));
+            return 1;
+        }
+        var regionPath = DimensionType.getStorageFolder(Minecraft.getInstance().level.dimension(), localServer.getWorldPath(LevelResource.ROOT)).resolve("region");
+        if ((!regionPath.toFile().exists())||!regionPath.toFile().isDirectory()) {
+            ctx.getSource().sendFailure(Component.translatable("Cannot find region folder for current dimension"));
+            return 1;
+        }
+        return fileBasedImporter(regionPath.toFile())?0:1;
+    }
+
     private static int importWorld(CommandContext<CommandSourceStack> ctx) {
         if (VoxyCommon.getInstance() == null) {
             ctx.getSource().sendFailure(Component.translatable("Voxy must be enabled in settings to use this"));
@@ -217,7 +261,7 @@ public class VoxyCommands {
             //We are in a world directory, so import the current dimension we are in
             /*
             for (var dim : new String[]{"overworld", "the_nether", "the_end"}) {//This is so annoying that you cant loop through all the dimensions
-                var id = ResourceKey.create(Registries.DIMENSION, ResourceLocation.withDefaultNamespace(dim));
+                var id = ResourceKey.create(Registries.DIMENSION, Identifier.withDefaultNamespace(dim));
                 var dimPath = DimensionType.getStorageFolder(id, file);
                 dimPath = dimPath.resolve("region");
                 var dimFile = dimPath.toFile();

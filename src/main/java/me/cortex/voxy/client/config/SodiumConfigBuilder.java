@@ -1,13 +1,12 @@
 package me.cortex.voxy.client.config;
 
-import me.cortex.voxy.common.util.Pair;
 import net.caffeinemc.mods.sodium.api.config.ConfigState;
 import net.caffeinemc.mods.sodium.api.config.StorageEventHandler;
 import net.caffeinemc.mods.sodium.api.config.option.*;
 import net.caffeinemc.mods.sodium.api.config.structure.*;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.contents.TranslatableContents;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
@@ -15,9 +14,67 @@ import java.util.function.*;
 
 public class SodiumConfigBuilder {
 
-    private static record Enabler(Predicate<ConfigState> tester, Identifier[] dependencies) {
+    private static class Enabler {
+        public final Predicate<ConfigState> tester;
+        public final Identifier[] dependencies;
+        public final boolean joinParent;
+        public Enabler inheritedEnabler;
+        public Enabler baseEnabler;
+        public Enabler(Predicate<ConfigState> tester, Identifier[] dependencies, boolean joinParent) {
+            this.tester = tester;
+            this.dependencies = dependencies;
+            this.joinParent = joinParent;
+        }
         public Enabler(Predicate<ConfigState> tester, String[] dependencies) {
-            this(tester, mapIds(dependencies));
+            this(tester, dependencies, false);
+        }
+        public Enabler(Predicate<ConfigState> tester, Identifier[] dependencies) {
+            this(tester, dependencies, false);
+        }
+        public Enabler(Predicate<ConfigState> tester, String[] dependencies, boolean joinParent) {
+            this(tester, mapIds(dependencies), joinParent);
+        }
+
+        /*
+        public static Enabler joinAnd(Enabler... enablers) {
+            Set<Identifier> identifiers = new HashSet<>();
+            for (var e : enablers) {
+                for (var i : e.dependencies) {
+                    identifiers.add(i);
+                }
+            }
+            Predicate<ConfigState> tester = state->{
+                for (var test:enablers) {
+                    if (!test.tester.test(state)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            var newEnabler = new Enabler(tester, identifiers.toArray(Identifier[]::new));
+            return newEnabler;
+        }*/
+        public Enabler joinAnd(Enabler parent) {
+            Set<Identifier> identifiers = new HashSet<>();
+            for (var i : this.dependencies) {
+                identifiers.add(i);
+            }
+            for (var i : parent.dependencies) {
+                identifiers.add(i);
+            }
+            Predicate<ConfigState> tester = state->{
+                if (!this.tester.test(state)) {
+                    return false;
+                }
+                if (!parent.tester.test(state)) {
+                    return false;
+                }
+                return true;
+            };
+            var newEnabler = new Enabler(tester, identifiers.toArray(Identifier[]::new));
+            newEnabler.baseEnabler = this;
+            newEnabler.inheritedEnabler = parent;
+            return newEnabler;
         }
     }
 
@@ -28,29 +85,48 @@ public class SodiumConfigBuilder {
         private TYPE setEnabler0(Enabler enabler) {
             this.prevEnabler = this.enabler;
             this.enabler = enabler;
-            {
-                var children = this.getEnablerChildren();
-                if (children != null) {
-                    for (var child : children) {
-                        if (child.enabler == null || child.enabler == this.prevEnabler) {
-                            child.setEnabler0(this.enabler);
-                        }
-                    }
+            this.updateChildren();
+            return (TYPE) this;
+        }
+        private void updateChildren() {
+            var children = this.getEnablerChildren();
+            if (children != null) {
+                for (var child : children) {
+                    child.parentEnablerUpdate(this);
                 }
             }
+        }
 
+        private TYPE parentEnablerUpdate(Enableable parent) {
+            if (this.enabler == null) {
+                this.setEnabler0(parent.enabler);
+            } else if (this.enabler == parent.prevEnabler) {
+                this.setEnabler0(parent.enabler);
+            } else if (this.enabler.inheritedEnabler != null && this.enabler.inheritedEnabler == parent.prevEnabler) {
+                this.setEnabler0(this.enabler.baseEnabler.joinAnd(parent.enabler));
+            } else if (this.enabler.inheritedEnabler == null && this.enabler.joinParent) {
+                this.setEnabler0(this.enabler.joinAnd(parent.enabler));
+            }
             return (TYPE) this;
         }
 
         public TYPE setEnabler(Predicate<ConfigState> enabler, String... dependencies) {
-            return this.setEnabler0(new Enabler(enabler, dependencies));
+            return this.setEnabler0(new Enabler(enabler, dependencies, false));
+        }
+
+        public TYPE setEnablerInherit(Predicate<ConfigState> enabler, String... dependencies) {
+            return this.setEnabler0(new Enabler(enabler, dependencies, true));
+        }
+
+        public TYPE setEnablerInherit(Predicate<ConfigState> enabler, Identifier... dependencies) {
+            return this.setEnabler0(new Enabler(enabler, dependencies, true));
         }
 
         public TYPE setEnabler(String enabler) {
             if (enabler == null) {
                 return this.setEnabler(s->true);
             }
-            var id = ResourceLocation.parse(enabler);
+            var id = Identifier.parse(enabler);
             return this.setEnabler(s->s.readBooleanOption(id), enabler);
         }
 
@@ -119,8 +195,10 @@ public class SodiumConfigBuilder {
         protected String id;
         protected Component name;
         protected Component tooltip;
+        protected Function<TYPE, Component> tooltipSupplier;
         protected Supplier<TYPE> getter;
         protected Consumer<TYPE> setter;
+        protected OptionImpact impact;
         public Option(String id, Component name, Component tooltip, Supplier<TYPE> getter, Consumer<TYPE> setter) {
             this.id = id;
             this.name = name;
@@ -141,6 +219,15 @@ public class SodiumConfigBuilder {
             }
         }
 
+        public OPTION setTooltipSupplier(Function<TYPE, Component> supplier) {
+            this.tooltipSupplier = supplier;
+            return (OPTION) this;
+        }
+
+        public OPTION setImpact(OptionImpact impact) {
+            this.impact = impact;
+            return (OPTION) this;
+        }
 
         protected Consumer<TYPE> postRunner;
         protected Identifier[] postRunnerConflicts;
@@ -165,7 +252,7 @@ public class SodiumConfigBuilder {
 
             Set<Identifier> flags = new LinkedHashSet<>();
             if (this.postRunner != null) {
-                var id = ResourceLocation.parse(this.id);
+                var id = Identifier.parse(this.id);
                 var runner = this.postRunner;
                 var getter = this.getter;
                 ctx.postRunner.register(id, ()->runner.accept(getter.get()), this.postRunnerConflicts);
@@ -189,6 +276,14 @@ public class SodiumConfigBuilder {
             option.setStorageHandler(ctx.saveHandler);
 
             option.setDefaultValue(this.getter.get());
+
+            if (this.tooltipSupplier != null) {
+                option.setTooltip(this.tooltipSupplier);
+            }
+
+            if (this.impact != null) {
+                option.setImpact(this.impact);
+            }
 
             return option;
         }
@@ -216,7 +311,7 @@ public class SodiumConfigBuilder {
 
         @Override
         protected IntegerOptionBuilder createType(ConfigBuilder builder) {
-            return builder.createIntegerOption(ResourceLocation.parse(this.id));
+            return builder.createIntegerOption(Identifier.parse(this.id));
         }
 
         @Override
@@ -243,7 +338,39 @@ public class SodiumConfigBuilder {
 
         @Override
         protected BooleanOptionBuilder createType(ConfigBuilder builder) {
-            return builder.createBooleanOption(ResourceLocation.parse(this.id));
+            return builder.createBooleanOption(Identifier.parse(this.id));
+        }
+    }
+
+    public static class EnumOption<T extends Enum<T>> extends Option<T, EnumOption<T>, EnumOptionBuilder<T>> {
+        private final Class<T> theEnum;
+        private Function<T, Component> nameProvider = value->Component.literal(value==null?"NULL":value.toString());
+
+        public EnumOption(String id, Class<T> theEnum, Component name, Component tooltip, Supplier<T> getter, Consumer<T> setter) {
+            super(id, name, tooltip, getter, setter);
+            this.theEnum = theEnum;
+        }
+
+        public EnumOption(String id, Class<T> theEnum, Component name, Supplier<T> getter, Consumer<T> setter) {
+            super(id, name, getter, setter);
+            this.theEnum = theEnum;
+        }
+
+        public EnumOption<T> setNameProvider(Function<T, Component> provider) {
+            this.nameProvider = provider;
+            return this;
+        }
+
+        @Override
+        protected EnumOptionBuilder<T> createType(ConfigBuilder builder) {
+            return builder.createEnumOption(Identifier.parse(this.id), this.theEnum);
+        }
+
+        @Override
+        protected EnumOptionBuilder<T> create(ConfigBuilder builder, BuildCtx ctx) {
+            var option = super.create(builder, ctx);
+            option.setElementNameProvider(this.nameProvider);
+            return option;
         }
     }
 
@@ -265,7 +392,7 @@ public class SodiumConfigBuilder {
         private Map<Identifier, Hook> hooks = new LinkedHashMap<>();
 
         public PostApplyOps register(String name, Runnable postRunner, String... conflicts) {
-            return this.register(ResourceLocation.parse(name), postRunner, mapIds(conflicts));
+            return this.register(Identifier.parse(name), postRunner, mapIds(conflicts));
         }
 
         public PostApplyOps register(Identifier name, Runnable postRunner, Identifier... conflicts) {

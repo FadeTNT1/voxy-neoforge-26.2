@@ -6,6 +6,7 @@ import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.voxelization.ILightingSupplier;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
 import me.cortex.voxy.common.voxelization.WorldConversionFactory;
+import me.cortex.voxy.common.voxelization.WorldVoxilizedSectionMipper;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
 import me.cortex.voxy.commonImpl.VoxyCommon;
@@ -32,23 +33,26 @@ public class VoxelIngestService {
 
     private void processJob() {
         var task = this.ingestQueue.pop();
-        task.world.markActive();
+        try {
+            var section = task.section;
+            var vs = SECTION_CACHE.get().setPosition(task.cx, task.cy, task.cz);
 
-        var section = task.section;
-        var vs = SECTION_CACHE.get().setPosition(task.cx, task.cy, task.cz);
-
-        if (section.hasOnlyAir() && task.blockLight==null && task.skyLight==null) {//If the chunk section has lighting data, propagate it
-            WorldUpdater.insertUpdate(task.world, vs.zero());
-        } else {
-            VoxelizedSection csec = WorldConversionFactory.convert(
-                    SECTION_CACHE.get(),
-                    task.world.getMapper(),
-                    section.getStates(),
-                    section.getBiomes(),
-                    getLightingSupplier(task)
-            );
-            WorldConversionFactory.mipSection(csec, task.world.getMapper());
-            WorldUpdater.insertUpdate(task.world, csec);
+            if (section.hasOnlyAir() && task.blockLight == null && task.skyLight == null) {//If the chunk section has lighting data, propagate it
+                WorldUpdater.insertUpdate(task.world, vs.zero());
+            } else {
+                VoxelizedSection csec = WorldConversionFactory.convert(
+                        vs,
+                        task.world.getMapper(),
+                        section.getStates(),
+                        section.getBiomes(),
+                        getLightingSupplier(task)
+                );
+                WorldVoxilizedSectionMipper.mipSection(csec, task.world.getMapper());
+                WorldUpdater.insertUpdate(task.world, csec);
+            }
+        } finally {
+            //Release the ref we had acquired for the world
+            task.world.releaseRef();
         }
     }
 
@@ -100,12 +104,11 @@ public class VoxelIngestService {
         var lightingProvider = chunk.getLevel().getLightEngine();
         boolean gotLighting = false;
 
-        // MC 1.21.1: LevelChunk.getMinSectionY() → chunk.getLevel().getMinSection()
-        int i = chunk.getLevel().getMinSection() - 1;
+        int i = chunk.getMinSectionY() - 1;
         boolean allEmpty = true;
         for (var section : chunk.getSections()) {
             i++;
-            if (section == null || !shouldIngestSection(section, chunk.getPos().x, i, chunk.getPos().z)) continue;
+            if (section == null || !shouldIngestSection(section, chunk.getPos().x(), i, chunk.getPos().z())) continue;
             allEmpty&=section.hasOnlyAir();
             //if (section.isEmpty()) continue;
             var pos = SectionPos.of(chunk.getPos(), i);
@@ -116,17 +119,17 @@ public class VoxelIngestService {
 
         if (allEmpty&&!gotLighting) {
             //Special case all empty chunk columns, we need to clear it out
-            // MC 1.21.1: LevelChunk.getMinSectionY() → chunk.getLevel().getMinSection()
-            i = chunk.getLevel().getMinSection() - 1;
+            i = chunk.getMinSectionY() - 1;
             for (var section : chunk.getSections()) {
                 i++;
-                if (section == null || !shouldIngestSection(section, chunk.getPos().x, i, chunk.getPos().z)) continue;
-                engine.markActive();
-                this.ingestQueue.add(new IngestSection(chunk.getPos().x, i, chunk.getPos().z, engine, section, null, null));
+                if (section == null || !shouldIngestSection(section, chunk.getPos().x(), i, chunk.getPos().z())) continue;
+                engine.acquireRef();
+                this.ingestQueue.add(new IngestSection(chunk.getPos().x(), i, chunk.getPos().z(), engine, section, null, null));
                 try {
                     this.service.execute();
                 } catch (Exception e) {
                     Logger.error("Executing had an error: assume shutting down, aborting",e);
+                    engine.releaseRef();//we must manually release
                     break;
                 }
             }
@@ -140,11 +143,10 @@ public class VoxelIngestService {
         var slp = lightingProvider.getLayerListener(LightLayer.SKY);
 
 
-        // MC 1.21.1: LevelChunk.getMinSectionY() → chunk.getLevel().getMinSection()
-        i = chunk.getLevel().getMinSection() - 1;
+        i = chunk.getMinSectionY() - 1;
         for (var section : chunk.getSections()) {
             i++;
-            if (section == null || !shouldIngestSection(section, chunk.getPos().x, i, chunk.getPos().z)) continue;
+            if (section == null || !shouldIngestSection(section, chunk.getPos().x(), i, chunk.getPos().z())) continue;
             //if (section.isEmpty()) continue;
             var pos = SectionPos.of(chunk.getPos(), i);
 
@@ -162,12 +164,13 @@ public class VoxelIngestService {
             //if (blNone && slNone) {
             //    continue;
             //}
-            engine.markActive();
-            this.ingestQueue.add(new IngestSection(chunk.getPos().x, i, chunk.getPos().z, engine, section, bl, sl));//TODO: fixme, this is technically not safe todo on the chunk load ingest, we need to copy the section data so it cant be modified while being read
+            engine.acquireRef();//This is not great but dont really have a better solution as all the others have there own problem
+            this.ingestQueue.add(new IngestSection(chunk.getPos().x(), i, chunk.getPos().z(), engine, section, bl, sl));//TODO: fixme, this is technically not safe todo on the chunk load ingest, we need to copy the section data so it cant be modified while being read
             try {
                 this.service.execute();
             } catch (Exception e) {
                 Logger.error("Executing had an error: assume shutting down, aborting",e);
+                engine.releaseRef();//we must manually release
                 break;
             }
         }
@@ -180,6 +183,11 @@ public class VoxelIngestService {
 
     public void shutdown() {
         this.service.shutdown();
+        while (!this.ingestQueue.isEmpty()) {
+            //We need to manually release all our world locks
+            this.ingestQueue.pop().world.releaseRef();
+        }
+
     }
 
     //Utility method to ingest a chunk into the given WorldIdentifier or world
@@ -199,12 +207,14 @@ public class VoxelIngestService {
     }
 
     private boolean rawIngest0(WorldEngine engine, LevelChunkSection section, int x, int y, int z, DataLayer bl, DataLayer sl) {
+        engine.acquireRef();
         this.ingestQueue.add(new IngestSection(x, y, z, engine, section, bl, sl));
         try {
             this.service.execute();
             return true;
         } catch (Exception e) {
             Logger.error("Executing had an error: assume shutting down, aborting",e);
+            engine.releaseRef();//we must manually release
             return false;
         }
     }

@@ -13,14 +13,12 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: 25
 
-      - name: Loom Cache
-        uses: actions/cache@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          path: "**/.gradle/loom-cache"
-          key: "${{ runner.os }}-gradle-${{ hashFiles('**/libs.versions.*', '**/*.gradle*', '**/gradle-wrapper.properties') }}"
-          restore-keys: "${{ runner.os }}-gradle-"
+          python-version: '3.13'
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -29,4 +27,4 @@ jobs:
           cache-cleanup: never
 
       - name: Gradle build
-        run: ./gradlew -I init.gradle build
+        run: ./gradlew build --console=plain

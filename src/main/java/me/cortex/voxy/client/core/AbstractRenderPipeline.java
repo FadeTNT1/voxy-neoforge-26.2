@@ -3,6 +3,7 @@ package me.cortex.voxy.client.core;
 import me.cortex.voxy.client.RenderStatistics;
 import me.cortex.voxy.client.TimingStatistics;
 import me.cortex.voxy.client.VoxyClient;
+import me.cortex.voxy.client.core.gl.GlFramebuffer;
 import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
@@ -12,6 +13,7 @@ import me.cortex.voxy.client.core.rendering.post.FullscreenBlit;
 import me.cortex.voxy.client.core.rendering.section.backend.AbstractSectionRenderer;
 import me.cortex.voxy.client.core.rendering.util.DepthFramebuffer;
 import me.cortex.voxy.client.core.rendering.util.DownloadStream;
+import me.cortex.voxy.client.core.util.GPUTiming;
 import me.cortex.voxy.common.util.TrackedObject;
 import org.joml.Matrix4f;
 import org.lwjgl.opengl.GL30;
@@ -32,18 +34,25 @@ import static org.lwjgl.opengl.GL11C.glEnable;
 import static org.lwjgl.opengl.GL11C.glStencilFunc;
 import static org.lwjgl.opengl.GL11C.glStencilMask;
 import static org.lwjgl.opengl.GL11C.glStencilOp;
+import static org.lwjgl.opengl.GL30C.GL_COLOR_ATTACHMENT0;
 import static org.lwjgl.opengl.GL30C.GL_DEPTH24_STENCIL8;
 import static org.lwjgl.opengl.GL30C.GL_FRAMEBUFFER;
 import static org.lwjgl.opengl.GL30C.glBindFramebuffer;
-import static org.lwjgl.opengl.GL42.GL_LEQUAL;
-import static org.lwjgl.opengl.GL42.GL_NOTEQUAL;
-import static org.lwjgl.opengl.GL42.glDepthFunc;
 import static org.lwjgl.opengl.GL42.*;
+import static org.lwjgl.opengl.GL42.GL_DEPTH_ATTACHMENT;
+import static org.lwjgl.opengl.GL42.GL_DEPTH_STENCIL;
+import static org.lwjgl.opengl.GL42.GL_NEAREST;
+import static org.lwjgl.opengl.GL42.GL_TEXTURE_MAG_FILTER;
+import static org.lwjgl.opengl.GL42.GL_TEXTURE_MIN_FILTER;
+import static org.lwjgl.opengl.GL42.glDepthFunc;
+import static org.lwjgl.opengl.GL42.glDepthMask;
+import static org.lwjgl.opengl.GL42.glUniform2f;
+import static org.lwjgl.opengl.GL42.nglUniformMatrix4fv;
 import static org.lwjgl.opengl.GL45.glClearNamedFramebufferfi;
-import static org.lwjgl.opengl.GL45.glGetNamedFramebufferAttachmentParameteri;
 import static org.lwjgl.opengl.GL45C.glBindTextureUnit;
 
 public abstract class AbstractRenderPipeline extends TrackedObject {
+    public final RenderProperties properties;
     private final BooleanSupplier frexStillHasWork;
 
     private final AsyncNodeManager nodeManager;
@@ -52,11 +61,11 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
     protected AbstractSectionRenderer<?,?> sectionRenderer;
 
-    private final FullscreenBlit depthMaskBlit = new FullscreenBlit("voxy:post/fullscreen2.vert", "voxy:post/noop.frag");
-    private final FullscreenBlit depthSetBlit = new FullscreenBlit("voxy:post/fullscreen2.vert", "voxy:post/depth0.frag");
-    private final FullscreenBlit depthCopy = new FullscreenBlit("voxy:post/fullscreen2.vert", "voxy:post/depth_copy.frag");
+    private final FullscreenBlit depthStencilSetup;
 
     public final DepthFramebuffer fb = new DepthFramebuffer(GL_DEPTH24_STENCIL8);
+
+    private final GlFramebuffer scratchFramebuffer = new GlFramebuffer();
 
     protected final boolean deferTranslucency;
 
@@ -66,12 +75,15 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
         glSamplerParameteri(DEPTH_SAMPLER, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     }
 
-    protected AbstractRenderPipeline(AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier, boolean deferTranslucency) {
+    protected AbstractRenderPipeline(RenderProperties properties, AsyncNodeManager nodeManager, NodeCleaner nodeCleaner, HierarchicalOcclusionTraverser traversal, BooleanSupplier frexSupplier, boolean deferTranslucency) {
+        this.properties = properties;
         this.frexStillHasWork = frexSupplier;
         this.nodeManager = nodeManager;
         this.nodeCleaner = nodeCleaner;
         this.traversal = traversal;
         this.deferTranslucency = deferTranslucency;
+
+        this.depthStencilSetup = new FullscreenBlit(properties, "voxy:post/fullscreen2.vert", "voxy:post/setup_stencil_depth.frag");
     }
 
     //Allows pipelines to configure model baking system
@@ -87,78 +99,77 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
     }
 
-    protected abstract int setup(Viewport<?> viewport, int sourceFramebuffer, int srcWidth, int srcHeight);
-    protected abstract void postOpaquePreTranslucent(Viewport<?> viewport);
-    protected void finish(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
+    protected abstract int setup(Viewport<?> viewport, int sourceDepthTexture, int srcWidth, int srcHeight);
+    protected abstract void postOpaquePreTranslucent(Viewport<?> viewport, int sourceDepthTexture);
+    protected void finish(Viewport<?> viewport, int sourceDepthTexture, int outputFramebuffer, int srcWidth, int srcHeight) {
         glDisable(GL_STENCIL_TEST);
-        glBindFramebuffer(GL_FRAMEBUFFER, sourceFrameBuffer);
     }
 
-    public void runPipeline(Viewport<?> viewport, int sourceFrameBuffer, int srcWidth, int srcHeight) {
-        int depthTexture = this.setup(viewport, sourceFrameBuffer, srcWidth, srcHeight);
+    public void runPipeline(Viewport<?> viewport, int sourceDepthTexture, int sourceColourTexture, int srcWidth, int srcHeight) {
+        int depthTexture = this.setup(viewport, sourceDepthTexture, srcWidth, srcHeight);
 
         var rs = ((AbstractSectionRenderer)this.sectionRenderer);
+        GPUTiming.INSTANCE.marker("RO");
         rs.renderOpaque(viewport);
         var occlusionDebug = VoxyClient.getOcclusionDebugState();
         if (occlusionDebug==0) {
+            GPUTiming.INSTANCE.marker("I");
             this.innerPrimaryWork(viewport, depthTexture);
+            GPUTiming.INSTANCE.marker();
         }
+
         if (occlusionDebug<=1) {
+            TimingStatistics.G.start();
             rs.buildDrawCalls(viewport);
+            TimingStatistics.G.stop();
         }
+
+        GPUTiming.INSTANCE.marker("TP");
         rs.renderTemporal(viewport);
 
-        this.postOpaquePreTranslucent(viewport);
+        rs.postOpaquePreperation(viewport);
+
+        this.postOpaquePreTranslucent(viewport, sourceDepthTexture);
+        GPUTiming.INSTANCE.marker("RT");
 
         if (!this.deferTranslucency) {
             rs.renderTranslucent(viewport);
         }
+        GPUTiming.INSTANCE.marker();
 
-        this.finish(viewport, sourceFrameBuffer, srcWidth, srcHeight);
-        glBindFramebuffer(GL_FRAMEBUFFER, sourceFrameBuffer);
+        //TODO:FIXME PERF, dont reattach every frame
+        this.scratchFramebuffer.bind(GL_DEPTH_ATTACHMENT, sourceDepthTexture)
+                .bind(GL_COLOR_ATTACHMENT0, sourceColourTexture);
+        this.finish(viewport, sourceDepthTexture, this.scratchFramebuffer.id, srcWidth, srcHeight);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    protected void initDepthStencil(int sourceFrameBuffer, int targetFb, int srcWidth, int srcHeight, int width, int height) {
-        glClearNamedFramebufferfi(targetFb, GL_DEPTH_STENCIL, 0, 1.0f, 1);
+    protected void initDepthStencil(Viewport<?> viewport, int sourceDepthTexture, int targetFb, int srcWidth, int srcHeight, int width, int height) {
+        glClearNamedFramebufferfi(targetFb, GL_DEPTH_STENCIL, 0, this.properties.clearDepth(), 1);
         // using blit to copy depth from mismatched depth formats is not portable so instead a full screen pass is performed for a depth copy
         // the mismatched formats in this case is the d32 to d24s8
         glBindFramebuffer(GL30.GL_FRAMEBUFFER, targetFb);
 
-        this.depthCopy.bind();
-        int depthTexture = glGetNamedFramebufferAttachmentParameteri(sourceFrameBuffer, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME);
-        glBindTextureUnit(0, depthTexture);
-        glBindSampler(0, DEPTH_SAMPLER);
-        glUniform2f(1,((float)width)/srcWidth, ((float)height)/srcHeight);
-        glColorMask(false,false,false,false);
-        this.depthCopy.blit();
+        //If pixel passes, update stencil to 0 and set depth to 0
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_ALWAYS);
 
-        /*
-        if (Capabilities.INSTANCE.isMesa){
-            glClearStencil(1);
-            glClear(GL_STENCIL_BUFFER_BIT);
-        }*/
-
-        //This whole thing is hell, we basicly want to create a mask stenicel/depth mask specificiclly
-        // in theory we could do this in a single pass by passing in the depth buffer from the sourceFrambuffer
-        // but the current implmentation does a 2 pass system
         glEnable(GL_STENCIL_TEST);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         glStencilFunc(GL_ALWAYS, 0, 0xFF);
         glStencilMask(0xFF);
 
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_NOTEQUAL);//If != 1 pass
-        //We do here
-        this.depthMaskBlit.blit();
-        glDisable(GL_DEPTH_TEST);
 
-        //Blit depth 0 where stencil is 0
-        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-        glStencilFunc(GL_EQUAL, 0, 0xFF);
+        this.depthStencilSetup.bind();
+        glBindTextureUnit(0, sourceDepthTexture);
+        glBindSampler(0, DEPTH_SAMPLER);
+        glUniform2f(1,((float)width)/srcWidth, ((float)height)/srcHeight);
+        glDepthMask(true);
+        glColorMask(false,false,false,false);
+        this.depthStencilSetup.blit();
 
-        this.depthSetBlit.blit();
 
-        glDepthFunc(GL_LEQUAL);
+        glDepthFunc(this.properties.closerEqualDepthCompare());
         glColorMask(true,true,true,true);
 
         //Make voxy terrain render only where there isnt mc terrain
@@ -218,16 +229,16 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
 
     @Override
     protected void free0() {
+        this.scratchFramebuffer.free();
         this.fb.free();
         this.sectionRenderer.free();
-        this.depthMaskBlit.delete();
-        this.depthSetBlit.delete();
-        this.depthCopy.delete();
+        this.depthStencilSetup.delete();
         super.free0();
     }
 
     public void addDebug(List<String> debug) {
         this.sectionRenderer.addDebug(debug);
+        this.traversal.addDebug(debug);
         RenderStatistics.addDebug(debug);
     }
 
@@ -241,6 +252,10 @@ public abstract class AbstractRenderPipeline extends TrackedObject {
     }
 
     public void bindUniforms(int index) {
+    }
+
+    public boolean hasTAA() {
+        return false;
     }
 
     //null means no function, otherwise return the taa injection function

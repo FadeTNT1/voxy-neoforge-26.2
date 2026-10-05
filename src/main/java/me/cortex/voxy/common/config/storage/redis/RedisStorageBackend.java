@@ -32,7 +32,7 @@ public class RedisStorageBackend extends StorageBackend {
     }
 
     @Override
-    public void iterateStoredSectionPositions(LongConsumer consumer) {
+    public void iteratePositions(int level , LongConsumer consumer) {
         throw new IllegalStateException("Not yet implemented");
     }
 
@@ -48,6 +48,9 @@ public class RedisStorageBackend extends StorageBackend {
                 return null;
             }
             //Need to copy to native memory
+            if (result.length == 0 || result.length > scratch.size) {
+                throw new IllegalStateException("Stored section exceeds scratch capacity: " + result.length);
+            }
             UnsafeUtil.memcpy(result, scratch.address);
             return scratch.subSize(result.length);
         }

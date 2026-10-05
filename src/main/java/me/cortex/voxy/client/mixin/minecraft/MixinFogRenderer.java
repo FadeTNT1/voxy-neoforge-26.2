@@ -1,26 +1,34 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
-import net.minecraft.client.renderer.FogRenderer;
+import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.fog.FogData;
+import net.minecraft.client.renderer.fog.FogRenderer;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-/**
- * MC 1.21.1 compatible fog mixin.
- *
- * This is a placeholder mixin that documents fog handling for NeoForge port.
- * The actual fog manipulation (save-restore pattern) is done in VoxyRenderSystem.renderOpaque()
- * to ensure vanilla terrain renders with normal fog, while Voxy LODs render with fog pushed to infinity.
- *
- * Render order:
- * 1. setupFog(FOG_TERRAIN) called - fog set to vanilla render distance
- * 2. Vanilla terrain renders - with normal fog
- * 3. Voxy renderOpaque() called:
- *    a. Save current fog values
- *    b. Push fog to infinity (999999.0f)
- *    c. Render LODs without fog wall
- *    d. Restore original fog values
- * 4. Clouds/other elements render - with correct fog
- */
-@Mixin(FogRenderer.class)
+@Mixin(value = FogRenderer.class, priority = 900)//We must execute before sodium
 public class MixinFogRenderer {
-    // No injections needed - VoxyRenderSystem handles fog save-restore directly
+    @Inject(method = "setupFog", at = @At("RETURN"))
+    private void voxy$modifyFog(Camera camera, int renderDistanceInChunks, DeltaTracker deltaTracker, float darkenWorldAmount, ClientLevel level, CallbackInfoReturnable<FogData> cir) {
+        if (!VoxyConfig.CONFIG.isRenderingEnabled()) return;
+
+        var vrs = IVoxyRenderSystemHolder.getNullable();
+        if (vrs == null) return;
+        var data = cir.getReturnValue();
+        boolean fogIsDamnClose = data.environmentalEnd<10;
+        var mode = VoxyConfig.CONFIG.getFogMode();
+        if (mode.removesVanillaEnvFog && !fogIsDamnClose) {
+            data.environmentalStart = 99999999;
+            data.environmentalEnd = 99999999;
+        }
+
+        data.renderDistanceStart = 999999999;
+        data.renderDistanceEnd = 999999999;
+    }
 }

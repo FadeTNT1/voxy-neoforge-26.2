@@ -9,25 +9,22 @@ import me.cortex.voxy.common.util.Pair;
 import me.cortex.voxy.common.util.UnsafeUtil;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
 import me.cortex.voxy.common.voxelization.WorldConversionFactory;
+import me.cortex.voxy.common.voxelization.WorldVoxilizedSectionMipper;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
 import net.minecraft.core.Holder;
-import net.minecraft.core.IdMap;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.chunk.DataLayer;
-import net.minecraft.world.level.chunk.PalettedContainer;
-import net.minecraft.world.level.chunk.PalettedContainer.Strategy;
-import net.minecraft.world.level.chunk.PalettedContainerRO;
+import net.minecraft.world.level.chunk.*;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
@@ -52,6 +49,8 @@ import java.util.function.Predicate;
 
 public class WorldImporter implements IDataImporter {
     private final WorldEngine world;
+    private final int minSectionY;
+    private final int maxSectionY;
     private final PalettedContainerRO<Holder<Biome>> defaultBiomeProvider;
     private final Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec;
     private final Codec<PalettedContainer<BlockState>> blockStateCodec;
@@ -63,12 +62,21 @@ public class WorldImporter implements IDataImporter {
     private final Service service;
 
     private volatile boolean isRunning;
+    private final AtomicBoolean worldRefAcquired = new AtomicBoolean();
+    private ZipFile zipSource;
 
     public WorldImporter(WorldEngine worldEngine, Level mcWorld, ServiceManager sm, BooleanSupplier runChecker) {
+        this(worldEngine, mcWorld.registryAccess(), mcWorld.getMinY(), mcWorld.getHeight(), sm, runChecker);
+    }
+
+    WorldImporter(WorldEngine worldEngine, RegistryAccess registries, int minY, int height,
+                  ServiceManager sm, BooleanSupplier runChecker) {
         this.world = worldEngine;
+        this.minSectionY = Math.floorDiv(minY, 16);
+        this.maxSectionY = Math.floorDiv(minY + height + 15, 16);
         this.service = sm.createService(()->new Pair<>(()->this.jobQueue.poll().run(), ()->{}), 3, "World importer", runChecker);
 
-        var biomeRegistry = mcWorld.registryAccess().lookupOrThrow(Registries.BIOME);
+        var biomeRegistry = registries.lookupOrThrow(Registries.BIOME);
         var defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
         this.defaultBiomeProvider = new PalettedContainerRO<>() {
             @Override
@@ -78,7 +86,7 @@ public class WorldImporter implements IDataImporter {
 
             @Override
             public void getAll(Consumer<Holder<Biome>> action) {
-
+                action.accept(defaultBiome);
             }
 
             @Override
@@ -91,16 +99,29 @@ public class WorldImporter implements IDataImporter {
                 return 0;
             }
 
-            // MC 1.21.1: bitsPerEntry() and copy() removed from interface - methods deleted
+            @Override
+            public int bitsPerEntry() {
+                return 0;
+            }
 
             @Override
             public boolean maybeHas(Predicate<Holder<Biome>> predicate) {
-                return false;
+                return predicate.test(defaultBiome);
+            }
+
+            @Override
+            public void forEachInPalette(Consumer<Holder<Biome>> consumer) {
+                consumer.accept(defaultBiome);
             }
 
             @Override
             public void count(PalettedContainer.CountConsumer<Holder<Biome>> counter) {
+                counter.accept(defaultBiome, 1);
+            }
 
+            @Override
+            public PalettedContainer<Holder<Biome>> copy() {
+                return null;
             }
 
             @Override
@@ -109,29 +130,30 @@ public class WorldImporter implements IDataImporter {
             }
 
             @Override
-            public PackedData<Holder<Biome>> pack(IdMap<Holder<Biome>> idMap, Strategy strategy) {
+            public PackedData<Holder<Biome>> pack(Strategy<Holder<Biome>> provider) {
                 return null;
             }
         };
 
-        // MC 1.21.1: PalettedContainerFactory removed - need to find correct codec creation API
-        // TODO: Fix codec creation for PalettedContainer in MC 1.21.1
-        this.biomeCodec = null; // Placeholder
-        this.blockStateCodec = null; // Placeholder
+        var factory = PalettedContainerFactory.create(registries);
+        this.biomeCodec = factory.biomeContainerCodec();
+        this.blockStateCodec = factory.blockStatesContainerCodec();
     }
 
 
     @Override
     public void runImport(IUpdateCallback updateCallback, ICompletionCallback completionCallback) {
-        if (this.isRunning) {
+        if (this.isRunning || this.isShutdown.get()) {
             throw new IllegalStateException();
         }
         if (this.worker == null) {//Can happen if no files
+            this.cleanup();
             completionCallback.onCompletion(0);
             return;
         }
         this.isRunning = true;
         this.world.acquireRef();
+        this.worldRefAcquired.set(true);
         this.updateCallback = updateCallback;
         this.completionCallback = completionCallback;
         this.worker.start();
@@ -144,24 +166,31 @@ public class WorldImporter implements IDataImporter {
 
     private final AtomicBoolean isShutdown = new AtomicBoolean();
     public void shutdown() {
-        if (this.isShutdown.getAndSet(true)) {
-            return;
-        }
         this.isRunning = false;
-        if (this.worker != null) {
+        var worker = this.worker;
+        if (worker != null && worker != Thread.currentThread()) {
             try {
-                this.worker.join();
+                worker.join();
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
         }
+        this.cleanup();
+    }
+
+    private void cleanup() {
+        if (this.isShutdown.getAndSet(true)) return;
         if (this.service.isLive()) {
-            this.world.releaseRef();
             this.service.shutdown();
         }
         //Free all the remaining entries by running the lambda
         while (!this.jobQueue.isEmpty()) {
             this.jobQueue.poll().run();
+        }
+        if (this.worldRefAcquired.getAndSet(false)) this.world.releaseRef();
+        if (this.zipSource != null) {
+            try { this.zipSource.close(); }
+            catch (IOException e) { Logger.error("Failed to close ZIP import source", e); }
         }
     }
 
@@ -192,6 +221,7 @@ public class WorldImporter implements IDataImporter {
         try {
             innerDirectory = innerDirectory.replace("\\\\", "\\").replace("\\", "/");
             var file = ZipFile.builder().setFile(zip).get();
+            this.zipSource = file;
             ArrayList<ZipArchiveEntry> regions = new ArrayList<>();
             for (var e = file.getEntries(); e.hasMoreElements();) {
                 var entry = e.nextElement();
@@ -211,26 +241,29 @@ public class WorldImporter implements IDataImporter {
                 if (entry.getSize() == 0) {
                     return;
                 }
-                var buf = new MemoryBuffer(entry.getSize());
-                try (var channel = Channels.newChannel(file.getInputStream(entry))) {
-                    if (channel.read(buf.asByteBuffer()) != buf.size) {
-                        buf.free();
-                        throw new IllegalStateException("Could not read full zip entry");
-                    }
+                if (entry.getSize() < 0 || entry.getSize() > Integer.MAX_VALUE) {
+                    throw new IOException("ZIP region exceeds supported buffer size: " + entry.getName());
                 }
-
-                var parts = entry.getName().split("/");
-                var name = parts[parts.length-1];
-                var sections = name.split("\\.");
-
+                var buf = new MemoryBuffer(entry.getSize());
                 try {
+                    try (var channel = Channels.newChannel(file.getInputStream(entry))) {
+                        var buffer = buf.asByteBuffer();
+                        while (buffer.hasRemaining()) {
+                            if (channel.read(buffer) <= 0) throw new IOException("Truncated ZIP region: " + entry.getName());
+                        }
+                    }
+                    var parts = entry.getName().split("/");
+                    var name = parts[parts.length-1];
+                    var sections = name.split("\\.");
                     this.importRegion(buf, Integer.parseInt(sections[1]), Integer.parseInt(sections[2]));
                 } catch (NumberFormatException e) {
-                    Logger.error("Invalid format for region position, x: \""+sections[1]+"\" z: \"" + sections[2] + "\" skipping region");
+                    Logger.error("Invalid region position, skipping ZIP entry: " + entry.getName());
+                } finally {
+                    buf.free();
                 }
-                buf.free();
             });
         } catch (Exception e) {
+            this.cleanup();
             throw new RuntimeException(e);
         }
 
@@ -241,43 +274,38 @@ public class WorldImporter implements IDataImporter {
         this.estimatedTotalChunks.set(0);
         this.chunksProcessed.set(0);
         this.worker = new Thread(() -> {
-            this.estimatedTotalChunks.addAndGet(regionFiles.length*1024);
-            for (var file : regionFiles) {
-                this.estimatedTotalChunks.addAndGet(-1024);
-                try {
-                    importer.importRegion(file);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-                while ((this.totalChunks.get()-this.chunksProcessed.get() > 10_000) && this.isRunning) {
+            try {
+                this.estimatedTotalChunks.addAndGet(regionFiles.length*1024);
+                for (var file : regionFiles) {
+                    this.estimatedTotalChunks.addAndGet(-1024);
                     try {
-                        Thread.sleep(1);
-                    } catch (InterruptedException e) {
+                        importer.importRegion(file);
+                    } catch (Exception e) {
                         throw new RuntimeException(e);
                     }
+                    while (this.service.numJobs() > 10_000 && this.isRunning) {
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    if (!this.isRunning) {
+                        return;
+                    }
                 }
-                if (!this.isRunning) {
-                    this.service.blockTillEmpty();
-                    this.completionCallback.onCompletion(this.totalChunks.get());
+                this.service.blockTillEmpty();
+            } catch (Exception e) {
+                this.isRunning = false;
+                Logger.error("World import failed; source data preserved", e);
+            } finally {
+                try { this.cleanup(); }
+                finally {
+                    this.isRunning = false;
                     this.worker = null;
-                    return;
+                    this.completionCallback.onCompletion(this.chunksProcessed.get());
                 }
             }
-            this.service.blockTillEmpty();
-            while (this.chunksProcessed.get() != this.totalChunks.get() && this.isRunning) {
-                Thread.yield();
-                try {
-                    Thread.sleep(10);
-                } catch (InterruptedException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-            if (!this.isShutdown.getAndSet(true)) {
-                this.worker = null;
-                this.service.shutdown();
-                this.world.releaseRef();
-            }
-            this.completionCallback.onCompletion(this.totalChunks.get());
         });
         this.worker.setName("World importer");
     }
@@ -310,14 +338,18 @@ public class WorldImporter implements IDataImporter {
             if (fileStream.size() == 0) {
                 return;
             }
+            if (fileStream.size() > Integer.MAX_VALUE) throw new IOException("Region file exceeds supported buffer size: " + file);
             var fileData = new MemoryBuffer(fileStream.size());
-            if (fileStream.read(fileData.asByteBuffer(), 0) < 8192) {
+            try {
+                var buffer = fileData.asByteBuffer();
+                while (buffer.hasRemaining()) {
+                    int read = fileStream.read(buffer);
+                    if (read <= 0) throw new IOException("Region file was truncated while reading " + file);
+                }
+                this.importRegion(fileData, rx, rz);
+            } finally {
                 fileData.free();
-                Logger.warn("Header of region file invalid");
-                return;
             }
-            this.importRegion(fileData, rx, rz);
-            fileData.free();
         }
     }
 
@@ -342,7 +374,7 @@ public class WorldImporter implements IDataImporter {
             }
 
             //TODO: create memory copy for each section
-            if (regionFile.size < ((sectorCount-1) + sectorStart) * 4096L) {
+            if (sectorStart < 2 || regionFile.size < (sectorCount + (long)sectorStart) * 4096L) {
                 Logger.warn("Cannot access chunk sector as it goes out of bounds. start bytes: " + (sectorStart*4096) + " sector count: " + sectorCount + " fileSize: " + regionFile.size);
                 continue;
             }
@@ -352,11 +384,11 @@ public class WorldImporter implements IDataImporter {
                 int chunkLen = sectorCount * 4096;
                 int m = Integer.reverseBytes(MemoryUtil.memGetInt(base));
                 byte b = MemoryUtil.memGetByte(base + 4L);
-                if (m == 0) {
+                if (m <= 1) {
                     Logger.error("Chunk is allocated, but stream is missing");
                 } else {
                     int n = m - 1;
-                    if (regionFile.size < (n + sectorStart*4096L)) {
+                    if (regionFile.size < (5L + n + sectorStart*4096L)) {
                         Logger.warn("Chunk stream to small");
                     } else if ((b & 128) != 0) {
                         if (n != 0) {
@@ -379,7 +411,7 @@ public class WorldImporter implements IDataImporter {
                                     if (decompressedData == null) {
                                         Logger.error("Error decompressing chunk data");
                                     } else {
-                                        var nbt = NbtIo.read(decompressedData);
+                                        var nbt = NbtIo.read(decompressedData, NbtAccounter.create(64L * 1024 * 1024));
                                         this.importChunkNBT(nbt, x, z);
                                     }
                                 }
@@ -399,28 +431,7 @@ public class WorldImporter implements IDataImporter {
     }
 
     private static InputStream createInputStream(MemoryBuffer data) {
-        return new InputStream() {
-            private long offset = 0;
-            @Override
-            public int read() {
-                return MemoryUtil.memGetByte(data.address + (this.offset++)) & 0xFF;
-            }
-
-            @Override
-            public int read(byte[] b, int off, int len) {
-                len = Math.min(len, this.available());
-                if (len == 0) {
-                    return -1;
-                }
-                UnsafeUtil.memcpy(data.address+this.offset, len, b, off); this.offset+=len;
-                return len;
-            }
-
-            @Override
-            public int available() {
-                return (int) (data.size-this.offset);
-            }
-        };
+        return new me.cortex.voxy.common.util.ByteBufferBackedInputStream(data.asByteBuffer());
     }
 
     private DataInputStream decompress(byte flags, MemoryBuffer stream) throws IOException {
@@ -441,26 +452,32 @@ public class WorldImporter implements IDataImporter {
         }
 
         //Dont process non full chunk sections
-        // MC 1.21.1: CompoundTag.getStringOr() → contains() + getString()
-        var status = ChunkStatus.byName(chunk.contains("Status") ? chunk.getString("Status") : null);
+        var status = ChunkStatus.byName(chunk.getStringOr("Status", null));
         if (status != ChunkStatus.FULL && status != ChunkStatus.EMPTY) {//We also import empty since they are from data upgrade
             this.totalChunks.decrementAndGet();
             return;
         }
 
         try {
-            // MC 1.21.1: CompoundTag.getIntOr() → contains() + getInt()
-            int x = chunk.contains("xPos") ? chunk.getInt("xPos") : Integer.MIN_VALUE;
-            int z = chunk.contains("zPos") ? chunk.getInt("zPos") : Integer.MIN_VALUE;
-            if (x>>5 != regionX || z>>5 != regionZ) {
-                Logger.error("Chunk position is not located in correct region, expected: (" + regionX + ", " + regionZ+"), got: " + "(" + (x>>5) + ", " + (z>>5)+"), importing anyway");
+            if (!(chunk.get("xPos") instanceof net.minecraft.nbt.IntTag)
+                    || !(chunk.get("zPos") instanceof net.minecraft.nbt.IntTag)) {
+                Logger.warn("Skipping imported chunk with invalid coordinate types");
+                return;
+            }
+            int x = chunk.getIntOr("xPos", Integer.MIN_VALUE);
+            int z = chunk.getIntOr("zPos", Integer.MIN_VALUE);
+            if (!isSupportedChunkPosition(x, z) || x>>5 != regionX || z>>5 != regionZ) {
+                Logger.error("Chunk position is not located in correct region, skipping chunk: " + x + ", " + z);
+                return;
             }
 
-            // MC 1.21.1: CompoundTag.getList() returns ListTag directly (not Optional)
-            for (var sectionE : chunk.getList("sections", 10)) { // Tag type 10 = CompoundTag
+            for (var sectionE : chunk.getList("sections").orElseThrow()) {
                 var section = (CompoundTag) sectionE;
-                // MC 1.21.1: CompoundTag.getIntOr() → contains() + getInt()
-                int y = section.contains("Y") ? section.getInt("Y") : Integer.MIN_VALUE;
+                int y = section.getIntOr("Y", Integer.MIN_VALUE);
+                if (y < this.minSectionY || y >= this.maxSectionY) {
+                    Logger.warn("Skipping imported section outside target world height: " + y);
+                    continue;
+                }
                 this.importSectionNBT(x, y, z, section);
             }
         } catch (Exception e) {
@@ -471,15 +488,18 @@ public class WorldImporter implements IDataImporter {
     }
 
     private static final byte[] EMPTY = new byte[0];
+    static boolean isSupportedChunkPosition(long x, long z) {
+        long limit = Level.MAX_LEVEL_SIZE / 16;
+        return x >= -limit && x < limit && z >= -limit && z < limit;
+    }
     private static final ThreadLocal<VoxelizedSection> SECTION_CACHE = ThreadLocal.withInitial(VoxelizedSection::createEmpty);
     private void importSectionNBT(int x, int y, int z, CompoundTag section) {
         if (section.getCompound("block_states").isEmpty()) {
             return;
         }
 
-        // MC 1.21.1: CompoundTag.getByteArray() returns empty byte[] if key not found (not Optional)
-        byte[] blockLightData = section.getByteArray("BlockLight");
-        byte[] skyLightData = section.getByteArray("SkyLight");
+        byte[] blockLightData = section.getByteArray("BlockLight").orElse(EMPTY);
+        byte[] skyLightData = section.getByteArray("SkyLight").orElse(EMPTY);
 
         DataLayer blockLight;
         if (blockLightData.length != 0) {
@@ -495,18 +515,21 @@ public class WorldImporter implements IDataImporter {
             skyLight = null;
         }
 
-        // MC 1.21.1: getCompound() returns CompoundTag directly, not Optional
-        var blockStatesRes = blockStateCodec.parse(NbtOps.INSTANCE, section.getCompound("block_states"));
-        if (!blockStatesRes.hasResultOrPartial()) {
-            //TODO: if its only partial, it means should try to upgrade the nbt format with datafixerupper probably
+        var blockStatesRes = blockStateCodec.parse(NbtOps.INSTANCE, section.getCompound("block_states").get());
+        if (blockStatesRes.isError()) {
+            Logger.warn("Skipping imported section with undecodable block palette at " + x + "," + y + "," + z);
             return;
         }
-        var blockStates = blockStatesRes.getPartialOrThrow();
+        var blockStates = blockStatesRes.getOrThrow();
         var biomes = this.defaultBiomeProvider;
-        // MC 1.21.1: getCompound() returns CompoundTag directly, check if tag exists
-        if (section.contains("biomes")) {
-            var biomesTag = section.getCompound("biomes");
-            biomes = this.biomeCodec.parse(NbtOps.INSTANCE, biomesTag).result().orElse(this.defaultBiomeProvider);
+        var optBiomes = section.getCompound("biomes");
+        if (optBiomes.isPresent()) {
+            var result = this.biomeCodec.parse(NbtOps.INSTANCE, optBiomes.get());
+            if (result.isError()) {
+                Logger.warn("Skipping imported section with undecodable biome palette at " + x + "," + y + "," + z);
+                return;
+            }
+            biomes = result.getOrThrow();
         }
         VoxelizedSection csec = WorldConversionFactory.convert(
                 SECTION_CACHE.get().setPosition(x, y, z),
@@ -526,7 +549,7 @@ public class WorldImporter implements IDataImporter {
                 }
         );
 
-        WorldConversionFactory.mipSection(csec, this.world.getMapper());
+        WorldVoxilizedSectionMipper.mipSection(csec, this.world.getMapper());
         WorldUpdater.insertUpdate(this.world, csec);
     }
 }

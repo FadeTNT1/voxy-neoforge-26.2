@@ -31,7 +31,7 @@ public class LMDBStorageBackend extends StorageBackend {
     public LMDBStorageBackend(String file) {
         this.dbi = new LMDBInterface.Builder()
                 .setMaxDbs(2)
-                .open(file, MDB_NOSUBDIR)//MDB_NOLOCK (IF I DO THIS, must sync the db manually)// TODO: THIS
+                .open(file, 0)//MDB_NOLOCK (IF I DO THIS, must sync the db manually)// TODO: THIS
                 .fetch();
         this.dbi.setMapSize(GROW_SIZE);
         this.sectionDatabase = this.dbi.createDb("world_sections");
@@ -50,16 +50,17 @@ public class LMDBStorageBackend extends StorageBackend {
             try {
                 return this.synchronizedTransaction(transaction);
             } catch (Throwable e) {
-                if (e.getMessage().startsWith("Code: -30792")) {
+                if (e.getMessage() != null && e.getMessage().startsWith("Code: -30792")) {
                     if (this.resizeLock.tryLock()) {
-                        //We must wait until all the other transactions have finished before we can resize
-                        while (this.accessingCounts.get() != 0) {
-                            Thread.onSpinWait();
+                        try {
+                            //We must wait until all the other transactions have finished before we can resize
+                            while (this.accessingCounts.get() != 0) {
+                                Thread.onSpinWait();
+                            }
+                            this.growEnv();
+                        } finally {
+                            this.resizeLock.unlock();
                         }
-
-                        this.growEnv();
-
-                        this.resizeLock.unlock();
                     }
                 } else {
                     throw e;
@@ -86,7 +87,7 @@ public class LMDBStorageBackend extends StorageBackend {
     }
 
     @Override
-    public void iterateStoredSectionPositions(LongConsumer consumer) {
+    public void iteratePositions(int level, LongConsumer consumer) {
         throw new IllegalStateException("Not yet implemented");
     }
 
@@ -99,6 +100,10 @@ public class LMDBStorageBackend extends StorageBackend {
             var bb = transaction.get(buff);
             if (bb == null) {
                 return null;
+            }
+            if (bb.remaining() <= 0 || bb.remaining() > scratch.size) {
+                throw new IllegalStateException("Saved section " + key + " has invalid size " + bb.remaining()
+                        + " for scratch capacity " + scratch.size + "; record preserved");
             }
             UnsafeUtil.memcpy(MemoryUtil.memAddress(bb), scratch.address, bb.remaining());
             return scratch.subSize(bb.remaining());
@@ -142,6 +147,9 @@ public class LMDBStorageBackend extends StorageBackend {
                     var keyPtr = MDBVal.malloc(transaction.stack);
                     var valPtr = MDBVal.malloc(transaction.stack);
                     while (cursor.get(MDB_NEXT, keyPtr, valPtr) != MDB_NOTFOUND) {
+                        if (keyPtr.mv_size() != Integer.BYTES || valPtr.mv_size() <= 0 || valPtr.mv_size() > Integer.MAX_VALUE) {
+                            throw new IllegalStateException("Invalid mapping record size; database preserved");
+                        }
                         int keyVal = keyPtr.mv_data().getInt(0);
                         byte[] data = new byte[(int) valPtr.mv_size()];
                         Objects.requireNonNull(valPtr.mv_data()).get(data);

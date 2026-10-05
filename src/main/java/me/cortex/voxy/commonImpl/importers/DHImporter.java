@@ -6,16 +6,15 @@ import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.util.ByteBufferBackedInputStream;
 import me.cortex.voxy.common.util.Pair;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
-import me.cortex.voxy.common.voxelization.WorldConversionFactory;
+import me.cortex.voxy.common.voxelization.WorldVoxilizedSectionMipper;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
 import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.core.Holder;
-import net.minecraft.core.HolderLookup;
 import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.ResourceKey;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
@@ -28,6 +27,7 @@ import org.lwjgl.util.zstd.Zstd;
 import org.tukaani.xz.BasicArrayCache;
 import org.tukaani.xz.ResettableArrayCache;
 import org.tukaani.xz.XZInputStream;
+import org.sqlite.SQLiteConfig;
 
 import java.io.DataInputStream;
 import java.io.File;
@@ -37,7 +37,6 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.channels.Channels;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -45,21 +44,22 @@ import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
 public class DHImporter implements IDataImporter {
     private final Connection db;
     private final WorldEngine engine;
     private final Service service;
-    private final Level world;
     private final int bottomOfWorld;
     private final int worldHeightSections;
-    // MC 1.21.1: Registry → HolderLookup.RegistryLookup, Holder.Reference → Holder
-    private final Holder<Biome> defaultBiome;
-    private final HolderLookup.RegistryLookup<Biome> biomeRegistry;
-    private final HolderLookup.RegistryLookup<Block> blockRegistry;
+    private final Holder.Reference<Biome> defaultBiome;
+    private final Registry<Biome> biomeRegistry;
+    private final Registry<Block> blockRegistry;
     private Thread runner;
     private volatile boolean isRunning = false;
+    private final AtomicBoolean isShutdown = new AtomicBoolean();
+    private final AtomicBoolean worldRefAcquired = new AtomicBoolean();
     private final AtomicInteger processedChunks = new AtomicInteger();
     private int totalChunks;
     private IUpdateCallback updateCallback;
@@ -94,26 +94,27 @@ public class DHImporter implements IDataImporter {
             if (this.zstdScratch != null) {
                 MemoryUtil.memFree(this.zstdScratch);
                 MemoryUtil.memFree(this.zstdScratch2);
-                Zstd.ZSTD_freeDCtx(this.zstdDCtx);
             }
+            Zstd.ZSTD_freeDCtx(this.zstdDCtx);
         }
     }
 
     public DHImporter(File file, WorldEngine worldEngine, Level mcWorld, ServiceManager servicePool, BooleanSupplier rateLimiter) {
-        this.engine = worldEngine;
-        this.world = mcWorld;
-        this.biomeRegistry = mcWorld.registryAccess().lookupOrThrow(Registries.BIOME);
-        this.defaultBiome = this.biomeRegistry.getOrThrow(Biomes.PLAINS);
-        this.blockRegistry = mcWorld.registryAccess().lookupOrThrow(Registries.BLOCK);
+        this(file, worldEngine, mcWorld.registryAccess(), mcWorld.getMinY(), mcWorld.getHeight(), servicePool, rateLimiter);
+    }
 
-        // MC 1.21.1: Level.getMinY() → getMinBuildHeight()
-        this.bottomOfWorld = mcWorld.getMinBuildHeight();
-        int worldHeight = mcWorld.getHeight();
+    DHImporter(File file, WorldEngine worldEngine, RegistryAccess registries, int minY, int worldHeight,
+               ServiceManager servicePool, BooleanSupplier rateLimiter) {
+        this.engine = worldEngine;
+        this.biomeRegistry = registries.lookupOrThrow(Registries.BIOME);
+        this.defaultBiome = this.biomeRegistry.getOrThrow(Biomes.PLAINS);
+        this.blockRegistry = registries.lookupOrThrow(Registries.BLOCK);
+
+        this.bottomOfWorld = minY;
         this.worldHeightSections = (worldHeight+15)/16;
 
-        String con = "jdbc:sqlite:" + file.getPath();
         try {
-            this.db = DriverManager.getConnection(con);
+            this.db = openReadOnlyDatabase(file);
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
@@ -138,61 +139,71 @@ public class DHImporter implements IDataImporter {
     }
 
     public void runImport(IUpdateCallback updateCallback, ICompletionCallback completionCallback) {
-        if (this.isRunning()) {
+        if (this.isRunning() || this.isShutdown.get()) {
             throw new IllegalStateException();
         }
         this.engine.acquireRef();
+        this.worldRefAcquired.set(true);
         this.updateCallback = updateCallback;
         this.runner = new Thread(()-> {
-            Queue<Task> taskQ = new PriorityQueue<>(Comparator.comparingLong(Task::distanceFromZero));
-            try (var stmt = this.db.createStatement()) {
-                var resSet = stmt.executeQuery("SELECT PosX,PosZ,CompressionMode,DataFormatVersion FROM FullData WHERE DetailLevel = 0;");
-                while (resSet.next()) {
-                    int x = resSet.getInt(1);
-                    int z = resSet.getInt(2);
-                    int compression = resSet.getInt(3);
-                    int format = resSet.getInt(4);
-                    if (format != 1) {
-                        Logger.warn("Unknown format mode: " + format);
-                        continue;
+            try {
+                Queue<Task> taskQ = new PriorityQueue<>(Comparator.comparingLong(Task::distanceFromZero));
+                try (var stmt = this.db.createStatement()) {
+                    var resSet = stmt.executeQuery("SELECT PosX,PosZ,CompressionMode,DataFormatVersion FROM FullData WHERE DetailLevel = 0;");
+                    while (resSet.next()) {
+                        long sourceX = resSet.getLong(1);
+                        long sourceZ = resSet.getLong(2);
+                        if (!isSupportedTilePosition(sourceX, sourceZ)) {
+                            Logger.warn("Skipping DH tile outside target coordinate range: " + sourceX + "," + sourceZ);
+                            continue;
+                        }
+                        int x = (int) sourceX;
+                        int z = (int) sourceZ;
+                        int compression = resSet.getInt(3);
+                        int format = resSet.getInt(4);
+                        if (format != 1) {
+                            Logger.warn("Unknown format mode: " + format);
+                            continue;
+                        }
+                        if (compression != 3 && compression != 4) {
+                            Logger.warn("Unknown compression mode: " + compression);
+                            continue;
+                        }
+                        taskQ.add(new Task(x, z, format, compression));
                     }
-                    if (compression != 3 && compression != 4) {
-                        Logger.warn("Unknown compression mode: " + compression);
-                        continue;
-                    }
-                    taskQ.add(new Task(x, z, format, compression));
-                }
-                resSet.close();
+                    resSet.close();
 
-            } catch (SQLException e) {
-                throw new RuntimeException(e);
-            }
-
-            this.totalChunks = taskQ.size() * (4*4);//(since there are 4*4 chunks to every dh section)
-
-            while (this.isRunning&&!taskQ.isEmpty()) {
-                this.tasks.add(taskQ.poll());
-                this.service.execute();
-
-                while (this.tasks.size() > 100 && this.isRunning) {
-                    try {
-                        Thread.sleep(500);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                }
-            }
-
-            while (!this.tasks.isEmpty()) {
-                try {
-                    Thread.sleep(500);
-                } catch (InterruptedException e) {
+                } catch (SQLException e) {
                     throw new RuntimeException(e);
                 }
-            }
 
-            completionCallback.onCompletion(this.processedChunks.get());
-            this.shutdown();
+                this.totalChunks = taskQ.size() * (4*4);//(since there are 4*4 chunks to every dh section)
+
+                while (this.isRunning&&!taskQ.isEmpty()) {
+                    this.tasks.add(taskQ.poll());
+                    this.service.execute();
+
+                    while (this.service.numJobs() > 100 && this.isRunning) {
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                }
+
+                this.service.blockTillEmpty();
+            } catch (Exception e) {
+                Logger.error("DH import failed; source database preserved", e);
+                this.isRunning = false;
+            } finally {
+                try { this.cleanup(); }
+                finally {
+                    this.isRunning = false;
+                    this.runner = null;
+                    completionCallback.onCompletion(this.processedChunks.get());
+                }
+            }
         });
         this.isRunning = true;
         this.runner.setDaemon(true);
@@ -219,8 +230,8 @@ public class DHImporter implements IDataImporter {
         final String STATE_STRING_SEPARATOR = "_STATE_";
         var stream = new DataInputStream(in);
         int entries = stream.readInt();
-        if (entries < 0)
-            throw new IllegalStateException();
+        if (entries < 0 || entries > (1 << 20))
+            throw new IOException("Invalid DH mapping count: " + entries);
         long[] out = new long[entries];
         for (int i = 0; i < entries; i++) {
             int biomeId;
@@ -230,11 +241,8 @@ public class DHImporter implements IDataImporter {
             if (idx == -1)
                 throw new IllegalStateException();
             {
-                var biomeRes = ResourceLocation.parse(encEntry.substring(0, idx));
-                // MC 1.21.1: RegistryLookup.get() requires ResourceKey, returns Optional<Holder.Reference<T>>
-                // Explicit type needed because orElse() with Holder<Biome> default causes type mismatch
-                var biomeKey = ResourceKey.create(Registries.BIOME, biomeRes);
-                Holder<Biome> biome = this.biomeRegistry.get(biomeKey).map(h -> (Holder<Biome>)h).orElse(this.defaultBiome);
+                var biomeRes = Identifier.parse(encEntry.substring(0, idx));
+                var biome = this.biomeRegistry.get(biomeRes).orElse(this.defaultBiome);
                 biomeId = this.engine.getMapper().getIdForBiome(biome);
             }
             {
@@ -247,10 +255,8 @@ public class DHImporter implements IDataImporter {
                     if (sIdx != -1) {
                         bStateStr = encEntry.substring(sIdx + STATE_STRING_SEPARATOR.length());
                     }
-                    var bId = ResourceLocation.parse(encEntry.substring(b, sIdx != -1 ? sIdx : encEntry.length()));
-                    // MC 1.21.1: RegistryLookup.get() requires ResourceKey, returns Optional<Holder<T>>
-                    var blockKey = ResourceKey.create(Registries.BLOCK, bId);
-                    var maybeBlock = this.blockRegistry.get(blockKey);
+                    var bId = Identifier.parse(encEntry.substring(b, sIdx != -1 ? sIdx : encEntry.length()));
+                    var maybeBlock = this.blockRegistry.get(bId);
                     Block block = Blocks.AIR;
                     if (maybeBlock.isPresent()) {
                         block = maybeBlock.get().value();
@@ -304,34 +310,37 @@ public class DHImporter implements IDataImporter {
     private static InputStream createDecompressedStream(int decompressor, InputStream in, WorkCTX ctx) throws IOException {
         if (decompressor == 3) {
             ctx.cache.reset();
-            return new XZInputStream(IOUtils.toBufferedInputStream(in), -1, false, ctx.cache);
+            return new XZInputStream(IOUtils.toBufferedInputStream(in), 256 * 1024, false, ctx.cache);
         } else if (decompressor == 4) {
-            if (ctx.zstdScratch == null) {
-                ctx.zstdScratch = MemoryUtil.memAlloc(8196);
-                ctx.zstdScratch2 = MemoryUtil.memAlloc(8196);
+            // A DH tile has 64x64 columns and 12-bit vertical spans. Bound both
+            // blob sizes before handing them to native code (256 MiB ceiling).
+            final int maxBlobSize = 256 * 1024 * 1024;
+            byte[] compressed;
+            try (in) { compressed = in.readNBytes(maxBlobSize + 1); }
+            if (compressed.length == 0 || compressed.length > maxBlobSize) {
+                throw new IOException("Invalid DH compressed blob size");
             }
-            ctx.zstdScratch.clear();
-            ctx.zstdScratch2.clear();
-            try(var channel = Channels.newChannel(in)) {
-                while (IOUtils.read(channel, ctx.zstdScratch) == 0) {
-                    var newBuffer = MemoryUtil.memAlloc(ctx.zstdScratch.position()*2);
-                    newBuffer.put(ctx.zstdScratch.rewind());
-                    MemoryUtil.memFree(ctx.zstdScratch);
-                    ctx.zstdScratch = newBuffer;
-                }
+            if (ctx.zstdScratch == null || ctx.zstdScratch.capacity() < compressed.length) {
+                var replacement = MemoryUtil.memAlloc(compressed.length);
+                MemoryUtil.memFree(ctx.zstdScratch);
+                ctx.zstdScratch = replacement;
             }
-            ctx.zstdScratch.limit(ctx.zstdScratch.position()).rewind();
-            {
-                int decompSize = (int) Zstd.ZSTD_getFrameContentSize(ctx.zstdScratch);
-                if (ctx.zstdScratch2.capacity() < decompSize) {
-                    MemoryUtil.memFree(ctx.zstdScratch2);
-                    ctx.zstdScratch2 = MemoryUtil.memAlloc((int) (decompSize * 1.1));
-                }
+            ctx.zstdScratch.clear().put(compressed).flip();
+            long expectedSize = Zstd.ZSTD_getFrameContentSize(ctx.zstdScratch);
+            if (expectedSize <= 0 || expectedSize > maxBlobSize) {
+                throw new IOException("Invalid or unknown DH decompressed blob size: " + expectedSize);
             }
-            long size = Zstd.ZSTD_decompressDCtx(ctx.zstdDCtx, ctx.zstdScratch, ctx.zstdScratch2);
+            if (ctx.zstdScratch2 == null || ctx.zstdScratch2.capacity() < expectedSize) {
+                var replacement = MemoryUtil.memAlloc(Math.toIntExact(expectedSize));
+                MemoryUtil.memFree(ctx.zstdScratch2);
+                ctx.zstdScratch2 = replacement;
+            }
+            ctx.zstdScratch2.clear().limit(Math.toIntExact(expectedSize));
+            long size = Zstd.ZSTD_decompressDCtx(ctx.zstdDCtx, ctx.zstdScratch2, ctx.zstdScratch);
             if (Zstd.ZSTD_isError(size)) {
-                throw new IllegalStateException("ZSTD EXCEPTION: " + Zstd.ZSTD_getErrorName(size));
+                throw new IOException("Invalid DH ZSTD frame: " + Zstd.ZSTD_getErrorName(size));
             }
+            if (size != expectedSize) throw new IOException("DH ZSTD frame size mismatch");
             ctx.zstdScratch2.limit((int) size);
             return new ByteBufferBackedInputStream(ctx.zstdScratch2);
         } else {
@@ -346,20 +355,23 @@ public class DHImporter implements IDataImporter {
         long[] storage = ctx.storageCache;
         VoxelizedSection section = ctx.section;
         byte[] col = ctx.colScratch;
+        // A failed previous tile may have left partial columns in this worker.
+        Arrays.fill(storage, 0);
         for (int x = 0; x < 64; x++) {
             for (int z = 0; z < 64; z++) {
                 int bPos = Integer.expand(x&0xF, 0b00_00_0000_0000_1111) |
                            Integer.expand(z, 0b00_11_0000_1111_0000);
-                short cl = stream.readShort();
-                if (cl < 0) {
-                    throw new IllegalStateException();
-                }
-                stream.read(col, 0, cl*8);
+                int cl = readColumn(stream, col);
                 for (int j = 0; j < cl; j++) {
                     long entry = (long) LONG.get(col, j*8);
-                    long mEntry = Mapper.withLight(mapping[getId(entry)], (getBlockLight(entry) << 4) | getSkyLight(entry));
+                    int id = getId(entry);
+                    if (id >= mapping.length) throw new IOException("DH column references missing mapping " + id);
+                    long mEntry = Mapper.withLight(mapping[id], (getBlockLight(entry) << 4) | getSkyLight(entry));
                     int startY = getMinHeight(entry);
                     int tall = getHeight(entry);
+                    if (tall == 0 || startY >= this.worldHeightSections * 16) {
+                        throw new IOException("DH column outside target world height");
+                    }
                     int endY = Math.min(startY+tall, this.worldHeightSections*16);
                     //if (endY < startY+tall && ((this.worldHeightSections*16)+1 != startY+tall)) {
                     //    int a = 0;
@@ -389,7 +401,7 @@ public class DHImporter implements IDataImporter {
                             section.lvl0NonAirCount = nonAirCount;
                         }
 
-                        WorldConversionFactory.mipSection(section, this.engine.getMapper());
+                        WorldVoxilizedSectionMipper.mipSection(section, this.engine.getMapper());
 
                         section.setPosition(X*4+(x>>4), sy+(this.bottomOfWorld>>4), (Z*4)+sz);
                         WorldUpdater.insertUpdate(this.engine, section);
@@ -404,6 +416,24 @@ public class DHImporter implements IDataImporter {
         }
         stream.close();
     }
+    static int readColumn(DataInputStream stream, byte[] column) throws IOException {
+        short count = stream.readShort();
+        if (count < 0 || count > column.length / Long.BYTES) throw new IOException("Invalid DH column length: " + count);
+        stream.readFully(column, 0, count * Long.BYTES);
+        return count;
+    }
+
+    static Connection openReadOnlyDatabase(File file) throws SQLException {
+        var config = new SQLiteConfig();
+        config.setReadOnly(true);
+        return DriverManager.getConnection("jdbc:sqlite:" + file.getPath(), config.toProperties());
+    }
+
+    static boolean isSupportedTilePosition(long x, long z) {
+        long limit = Level.MAX_LEVEL_SIZE / 64;
+        return x >= -limit && x < limit && z >= -limit && z < limit;
+    }
+
     private void importSection(PreparedStatement dataFetchStmt, WorkCTX ctx, Task task) {
         if (!this.isRunning) {
             return;
@@ -412,6 +442,7 @@ public class DHImporter implements IDataImporter {
             dataFetchStmt.setInt(1, task.x);
             dataFetchStmt.setInt(2, task.z);
             try (var rs = dataFetchStmt.executeQuery()) {
+                if (!rs.next()) throw new IOException("DH tile disappeared while importing");
                 var mapping = readMappings(createDecompressedStream(task.compression, rs.getBinaryStream(3), ctx), ctx);
                 //var columnGenStep = new byte[64*64];
                 //readStream(rs.getBinaryStream(2), cache, columnGenStep);
@@ -423,28 +454,29 @@ public class DHImporter implements IDataImporter {
     }
 
     public void shutdown() {
-        if (!this.isRunning) {
-            return;
-        }
         this.isRunning = false;
-        while (!this.tasks.isEmpty())
-            this.tasks.poll();
+        var runner = this.runner;
         try {
-            if (this.runner != Thread.currentThread()) {
-                this.runner.join();
+            if (runner != null && runner != Thread.currentThread()) {
+                runner.join();
             }
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
         }
+        this.cleanup();
+    }
+
+    private void cleanup() {
+        if (this.isShutdown.getAndSet(true)) return;
         this.service.shutdown();
-        this.engine.releaseRef();
+        this.tasks.clear();
+        if (this.worldRefAcquired.getAndSet(false)) this.engine.releaseRef();
         try {
             this.db.close();
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
         this.updateCallback = null;
-        this.runner = null;
     }
 
     @Override
@@ -472,7 +504,7 @@ public class DHImporter implements IDataImporter {
             hasJDBC = true;
         } catch (ClassNotFoundException | NoClassDefFoundError e) {
             //throw new RuntimeException(e);
-            Logger.warn("Unable to load sqlite JDBC or lzma decompressor, DHImporting wont be available", e);
+            Logger.warn("Unable to load sqlite JDBC or lzma decompressor, DHImporting wont be available");
         }
         HasRequiredLibraries = hasJDBC;
     }

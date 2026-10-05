@@ -1,13 +1,11 @@
 package me.cortex.voxy.client;
 
-import me.cortex.voxy.client.core.IGetVoxyRenderSystem;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.commonImpl.VoxyCommon;
-import net.minecraft.ChatFormatting;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.debug.DebugScreenDisplayer;
 import net.minecraft.client.gui.components.debug.DebugScreenEntry;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import org.jetbrains.annotations.Nullable;
@@ -27,19 +25,17 @@ public class VoxyDebugScreenEntry implements DebugScreenEntry {
             return;
         }
 
-        VoxyRenderSystem vrs = null;
-        var wr = Minecraft.getInstance().levelRenderer;
-        if (wr != null) vrs = ((IGetVoxyRenderSystem) wr).getVoxyRenderSystem();
+        VoxyRenderSystem vrs = IVoxyRenderSystemHolder.getNullable();
 
         //lines.addLineToSection();
         List<String> instanceLines = new ArrayList<>();
         instance.addDebug(instanceLines);
-        lines.addToGroup(ResourceLocation.fromNamespaceAndPath("voxy", "instance_debug"), instanceLines);
+        lines.addToGroup(Identifier.fromNamespaceAndPath("voxy", "instance_debug"), instanceLines);
 
         if (vrs != null) {
             List<String> renderLines = new ArrayList<>();
             vrs.addDebugInfo(renderLines);
-            lines.addToGroup(ResourceLocation.fromNamespaceAndPath("voxy", "render_debug"), renderLines);
+            lines.addToGroup(Identifier.fromNamespaceAndPath("voxy", "render_debug"), renderLines);
         }
     }
 

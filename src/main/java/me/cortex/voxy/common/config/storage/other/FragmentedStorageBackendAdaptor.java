@@ -1,14 +1,12 @@
 package me.cortex.voxy.common.config.storage.other;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.objects.Object2IntMap;
-import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
-import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.config.ConfigBuildCtx;
 import me.cortex.voxy.common.config.storage.StorageBackend;
 import me.cortex.voxy.common.config.storage.StorageConfig;
 import me.cortex.voxy.common.util.MemoryBuffer;
 import net.minecraft.world.level.levelgen.RandomSupport;
+
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -23,7 +21,7 @@ public class FragmentedStorageBackendAdaptor extends StorageBackend {
     public FragmentedStorageBackendAdaptor(StorageBackend... backends) {
         this.backends = backends;
         int len = backends.length;
-        if ((len&(len-1)) != 0) {
+        if (len == 0 || (len&(len-1)) != 0) {
             throw new IllegalArgumentException("Backend count not a power of 2");
         }
     }
@@ -33,9 +31,9 @@ public class FragmentedStorageBackendAdaptor extends StorageBackend {
     }
 
     @Override
-    public void iterateStoredSectionPositions(LongConsumer consumer) {
+    public void iteratePositions(int level, LongConsumer consumer) {
         for (var backend : this.backends) {
-            backend.iterateStoredSectionPositions(consumer);
+            backend.iteratePositions(level, consumer);
         }
     }
 
@@ -66,65 +64,21 @@ public class FragmentedStorageBackendAdaptor extends StorageBackend {
         }
     }
 
-    private record EqualingArray(byte[] bytes) {
-        @Override
-        public boolean equals(Object obj) {
-            return Arrays.equals(this.bytes, ((EqualingArray)obj).bytes);
-        }
-
-        @Override
-        public int hashCode() {
-            return Arrays.hashCode(this.bytes);
-        }
-    }
-
     @Override
     public Int2ObjectOpenHashMap<byte[]> getIdMappingsData() {
-        Object2IntOpenHashMap<Int2ObjectOpenHashMap<EqualingArray>> verification = new Object2IntOpenHashMap<>();
-        Int2ObjectOpenHashMap<EqualingArray> any = null;
-        for (var backend : this.backends) {
-            var mappings = backend.getIdMappingsData();
-            if (mappings.isEmpty()) {
-                //TODO: log a warning and attempt to replicate the data the other fragments
-                continue;
+        var mappings = this.backends[0].getIdMappingsData();
+        for (int i = 1; i < this.backends.length; i++) {
+            var other = this.backends[i].getIdMappingsData();
+            if (mappings.size() != other.size()) {
+                throw new IllegalStateException("Fragmented mapping stores disagree; original databases preserved");
             }
-            var repackaged = new Int2ObjectOpenHashMap<EqualingArray>(mappings.size());
             for (var entry : mappings.int2ObjectEntrySet()) {
-                repackaged.put(entry.getIntKey(), new EqualingArray(entry.getValue()));
-            }
-            verification.addTo(repackaged, 1);
-            any = repackaged;
-        }
-        if (any == null) {
-            return new Int2ObjectOpenHashMap<>();
-        }
-
-        if (verification.size() != 1) {
-            Logger.error("Error id mapping not matching across all fragments, attempting to recover");
-            Object2IntMap.Entry<Int2ObjectOpenHashMap<EqualingArray>> maxEntry = null;
-            for (var entry : verification.object2IntEntrySet()) {
-                if (maxEntry == null) { maxEntry = entry; }
-                else {
-                    if (maxEntry.getIntValue() < entry.getIntValue()) {
-                        maxEntry = entry;
-                    }
+                if (!Arrays.equals(entry.getValue(), other.get(entry.getIntKey()))) {
+                    throw new IllegalStateException("Fragmented mapping ID " + entry.getIntKey() + " disagrees; original databases preserved");
                 }
             }
-
-            var mapping = maxEntry.getKey();
-
-            var out = new Int2ObjectOpenHashMap<byte[]>(mapping.size());
-            for (var entry : mapping.int2ObjectEntrySet()) {
-                out.put(entry.getIntKey(), entry.getValue().bytes);
-            }
-            return out;
-        } else {
-            var out = new Int2ObjectOpenHashMap<byte[]>(any.size());
-            for (var entry : any.int2ObjectEntrySet()) {
-                out.put(entry.getIntKey(), entry.getValue().bytes);
-            }
-            return out;
         }
+        return mappings;
     }
 
     @Override

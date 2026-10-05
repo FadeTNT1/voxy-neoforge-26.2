@@ -1,43 +1,43 @@
 modLoader="javafml"
-loaderVersion="[4,)"
+loaderVersion="[11,)"
 license="All-Rights-Reserved"
-issueTrackerURL="https://github.com/MCRcortex/voxy/issues"
+issueTrackerURL="https://github.com/j-shelfwood/voxy-neoforge/issues"
 
 [[mods]]
 modId="voxy"
 version="${version}"
 displayName="Voxy"
 description="Far distance rendering mod utilising LoDs"
-authors="Cortex"
-logoFile="assets/voxy/icon.png"
+authors="Cortex; unofficial NeoForge port"
+iconFile="assets/voxy/icon.png"
 
 [[dependencies.voxy]]
 modId="neoforge"
 type="required"
-versionRange="[21.1,)"
+versionRange="[${neoforge_version},26.3)"
 ordering="NONE"
 side="BOTH"
 
 [[dependencies.voxy]]
 modId="minecraft"
 type="required"
-versionRange="[1.21.1]"
+versionRange="[${minecraft_version}]"
 ordering="NONE"
 side="BOTH"
 
 [[dependencies.voxy]]
 modId="sodium"
 type="required"
-versionRange="[0.6.13,)"
+versionRange="[0.9.2+mc26.2]"
 ordering="AFTER"
 side="CLIENT"
 
 [[dependencies.voxy]]
-modId="fabric_api"
-type="required"
-versionRange="[0.102.0,)"
-ordering="BEFORE"
-side="BOTH"
+modId="iris"
+type="optional"
+versionRange="[1.11.4,1.12)"
+ordering="AFTER"
+side="CLIENT"
 
 [[mixins]]
 config="client.voxy.mixins.json"

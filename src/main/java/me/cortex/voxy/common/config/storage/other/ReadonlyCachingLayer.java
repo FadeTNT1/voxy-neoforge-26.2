@@ -7,6 +7,7 @@ import me.cortex.voxy.common.config.storage.StorageConfig;
 import me.cortex.voxy.common.util.MemoryBuffer;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.List;
 import java.util.function.LongConsumer;
 
@@ -33,7 +34,7 @@ public class ReadonlyCachingLayer extends StorageBackend {
     }
 
     @Override
-    public void iterateStoredSectionPositions(LongConsumer consumer) {
+    public void iteratePositions(int level , LongConsumer consumer) {
         throw new IllegalStateException("Not yet implemented");
     }
 
@@ -54,20 +55,31 @@ public class ReadonlyCachingLayer extends StorageBackend {
 
     @Override
     public Int2ObjectOpenHashMap<byte[]> getIdMappingsData() {
-        //TODO: replicate this data onto the cache
-        return this.onMiss.getIdMappingsData();
+        var mappings = this.onMiss.getIdMappingsData();
+        for (var entry : this.cache.getIdMappingsData().int2ObjectEntrySet()) {
+            var previous = mappings.putIfAbsent(entry.getIntKey(), entry.getValue());
+            if (previous != null && !Arrays.equals(previous, entry.getValue())) {
+                throw new IllegalStateException("Conflicting cached mapping ID " + entry.getIntKey() + "; original databases preserved");
+            }
+        }
+        return mappings;
     }
 
     @Override
     public void flush() {
-        this.cache.close();
-        this.onMiss.close();
+        this.cache.flush();
+        this.onMiss.flush();
     }
 
     @Override
     public void close() {
         this.cache.close();
         this.onMiss.close();
+    }
+
+    @Override
+    public List<StorageBackend> getChildBackends() {
+        return List.of(this.cache, this.onMiss);
     }
 
     public static class Config extends StorageConfig {
